@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a small change with a clear outcome.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem or who needs this
+      description: Describe what someone is trying to do and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: Smallest useful change
+      description: Describe the smallest change that would help.
+    validations:
+      required: true
+  - type: textarea
+    id: success
+    attributes:
+      label: Observable success check
+      description: Give the command, the output, or what you would see or be able to do that shows the change works.
+    validations:
+      required: true
