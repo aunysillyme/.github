@@ -1,0 +1,165 @@
+name: Set sync
+
+on:
+  push:
+    branches: [main]
+    paths: [set.json, set-sync.targets.json]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: set-sync
+  cancel-in-progress: false
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      source_sha256: ${{ steps.list.outputs.source_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: list
+        name: Validate set and build target list
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const bytes = fs.readFileSync('set.json');
+          const set = JSON.parse(bytes);
+          const extras = JSON.parse(fs.readFileSync('set-sync.targets.json', 'utf8'));
+          const repo = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/;
+          if (!set || set.version !== 1 || !Array.isArray(set.rows) || !set.rows.length) throw Error('Expected version 1 and a nonempty rows array');
+          const names = new Set();
+          const targets = [];
+          for (const row of set.rows) {
+            if (!row || !['name', 'url', 'line'].every(k => typeof row[k] === 'string' && row[k].trim() && !/[\r\n]/.test(row[k]))) throw Error('Each row needs nonempty single-line name, url and line');
+            if (!repo.test(row.name) || row.url !== `https://github.com/aunysillyme/${row.name}` || row.line.includes('<!--')) throw Error(`Invalid set row: ${row.name}`);
+            const key = row.name.toLowerCase();
+            if (names.has(key)) throw Error(`Duplicate set row: ${row.name}`);
+            names.add(key);
+            targets.push(`aunysillyme/${row.name}`);
+          }
+          if (!Array.isArray(extras)) throw Error('Extra targets must be an array');
+          for (const target of extras) {
+            if (typeof target !== 'string' || !target.startsWith('aunysillyme/') || !repo.test(target.slice('aunysillyme/'.length))) throw Error(`Invalid extra target: ${target}`);
+            targets.push(target);
+          }
+          const unique = [...new Map(targets.map(target => [target.toLowerCase(), target])).values()].map(target => ({ target, name: target.slice('aunysillyme/'.length) }));
+          if (unique.length > 256) throw Error('Target list exceeds the GitHub Actions matrix limit');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include: unique })}\nsource_sha256=${crypto.createHash('sha256').update(bytes).digest('hex')}\n`);
+          NODE
+
+  sync:
+    needs: targets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - name: Mint repository token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.SET_SYNC_APP_ID }}
+          private-key: ${{ secrets.SET_SYNC_PRIVATE_KEY }}
+          owner: aunysillyme
+          repositories: ${{ matrix.name }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.target }}
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Prepare missing inputs
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          function ensureDirectory(dir) {
+            if (fs.existsSync(dir) && (!fs.lstatSync(dir).isDirectory() || fs.lstatSync(dir).isSymbolicLink())) throw Error(`Expected a real directory: ${dir}`);
+            fs.mkdirSync(dir, { recursive: true });
+          }
+          function createIfMissing(file, content) {
+            if (fs.existsSync(file) || fs.lstatSync(file, { throwIfNoEntry: false })) return;
+            fs.writeFileSync(file, content, { flag: 'wx' });
+          }
+          ensureDirectory('.repo-build');
+          ensureDirectory('scripts');
+          const name = process.env.TARGET.split('/')[1];
+          createIfMissing('.repo-build/config.json', JSON.stringify({ set: { source: 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json' } }, null, 2) + '\n');
+          const config = JSON.parse(fs.readFileSync('.repo-build/config.json', 'utf8'));
+          if (config.set?.source !== 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json') throw Error('Set source must point to the canonical main set.json');
+          if (!fs.existsSync('.repo-build/facts.json') && !fs.existsSync('package.json')) createIfMissing('.repo-build/facts.json', JSON.stringify({ name }, null, 2) + '\n');
+          createIfMissing('README.md', `# ${name}\n`);
+          createIfMissing('llms.txt', `# ${name}\n`);
+          NODE
+      - name: Sync and verify
+        env:
+          EXPECTED_SHA256: ${{ needs.targets.outputs.source_sha256 }}
+        run: |
+          if [ -f .repo-build/set.lock.json ]; then cp .repo-build/set.lock.json "$RUNNER_TEMP/previous-set-lock.json"; fi
+          env -u CI -u GITHUB_TOKEN npx --yes repo-build-skill@0.1.4 set sync
+          node <<'NODE'
+          const fs = require('node:fs');
+          const lockPath = '.repo-build/set.lock.json';
+          const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+          if (lock.source !== 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json' || lock.sha256 !== process.env.EXPECTED_SHA256) throw Error('Fetched set does not match this run; retry from main');
+          const previousPath = `${process.env.RUNNER_TEMP}/previous-set-lock.json`;
+          if (fs.existsSync(previousPath)) {
+            const previous = JSON.parse(fs.readFileSync(previousPath, 'utf8'));
+            const withoutDate = value => Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'fetched'));
+            if (JSON.stringify(withoutDate(previous)) === JSON.stringify(withoutDate(lock))) fs.writeFileSync(lockPath, JSON.stringify(previous, null, 2) + '\n');
+          }
+          NODE
+          node scripts/check-set.mjs
+      - name: Create or update pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          files=(.repo-build/config.json .repo-build/set.json .repo-build/set.lock.json .repo-build/render-set.mjs scripts/check-set.mjs README.md llms.txt)
+          if [ -f .repo-build/facts.json ]; then files+=(.repo-build/facts.json); fi
+          git add -- "${files[@]}"
+          if git diff --cached --quiet; then
+            echo 'result=unchanged' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sync the project set'
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push --force "https://github.com/$TARGET.git" HEAD:refs/heads/set-sync/update
+          unset auth
+          number=$(gh pr list --repo "$TARGET" --state open --head set-sync/update --base main --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --repo "$TARGET" --title 'Sync the project set' --body 'Update the shared project set and generated blocks.'
+            result='PR updated'
+          else
+            gh pr create --repo "$TARGET" --head set-sync/update --base main --title 'Sync the project set' --body 'Update the shared project set and generated blocks.' > /dev/null
+            number=$(gh pr list --repo "$TARGET" --state open --head set-sync/update --base main --json number --jq '.[0].number // empty')
+            test -n "$number"
+            result='PR opened'
+          fi
+          gh pr merge "$number" --repo "$TARGET" --auto --squash
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      - name: Summarize target
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          RESULT: ${{ steps.pr.outputs.result }}
+        run: |
+          printf '| Target | Result |\n| --- | --- |\n| %s | %s |\n' "$TARGET" "${RESULT:-failed}" >> "$GITHUB_STEP_SUMMARY"
