@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   targets:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,19 +45,19 @@ jobs:
             const key = row.name.toLowerCase();
             if (names.has(key)) throw Error(`Duplicate set row: ${row.name}`);
             names.add(key);
-            targets.push(`aunysillyme/${row.name}`);
+            targets.push({ target: `aunysillyme/${row.name}`, kind: 'set' });
           }
           if (!Array.isArray(extras)) throw Error('Extra targets must be an array');
           for (const target of extras) {
             if (typeof target !== 'string' || !target.startsWith('aunysillyme/') || !repo.test(target.slice('aunysillyme/'.length))) throw Error(`Invalid extra target: ${target}`);
-            targets.push(target);
+            targets.push({ target, kind: 'extra' });
           }
-          const unique = [...new Map(targets.map(target => [target.toLowerCase(), target])).values()].map(target => ({ target, name: target.slice('aunysillyme/'.length) }));
+          const unique = [...new Map(targets.reverse().map(item => [item.target.toLowerCase(), item])).values()].map(item => ({ ...item, name: item.target.slice('aunysillyme/'.length) }));
           if (unique.length > 256) throw Error('Target list exceeds the GitHub Actions matrix limit');
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include: unique })}\nsource_sha256=${crypto.createHash('sha256').update(bytes).digest('hex')}\n`);
           NODE
 
-  sync:
+  prepare:
     needs: targets
     runs-on: ubuntu-latest
     permissions:
@@ -65,51 +66,34 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     steps:
-      - name: Mint repository token
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          app-id: ${{ secrets.SET_SYNC_APP_ID }}
-          private-key: ${{ secrets.SET_SYNC_PRIVATE_KEY }}
-          owner: aunysillyme
-          repositories: ${{ matrix.name }}
+          path: source
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.target }}
           ref: main
-          token: ${{ steps.app.outputs.token }}
+          path: target
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - name: Prepare missing inputs
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          node <<'NODE'
-          const fs = require('node:fs');
-          function ensureDirectory(dir) {
-            if (fs.existsSync(dir) && (!fs.lstatSync(dir).isDirectory() || fs.lstatSync(dir).isSymbolicLink())) throw Error(`Expected a real directory: ${dir}`);
-            fs.mkdirSync(dir, { recursive: true });
-          }
-          function createIfMissing(file, content) {
-            if (fs.existsSync(file) || fs.lstatSync(file, { throwIfNoEntry: false })) return;
-            fs.writeFileSync(file, content, { flag: 'wx' });
-          }
-          ensureDirectory('.repo-build');
-          ensureDirectory('scripts');
-          const name = process.env.TARGET.split('/')[1];
-          createIfMissing('.repo-build/config.json', JSON.stringify({ set: { source: 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json' } }, null, 2) + '\n');
-          const config = JSON.parse(fs.readFileSync('.repo-build/config.json', 'utf8'));
-          if (config.set?.source !== 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json') throw Error('Set source must point to the canonical main set.json');
-          if (!fs.existsSync('.repo-build/facts.json') && !fs.existsSync('package.json')) createIfMissing('.repo-build/facts.json', JSON.stringify({ name }, null, 2) + '\n');
-          createIfMissing('README.md', `# ${name}\n`);
-          createIfMissing('llms.txt', `# ${name}\n`);
-          NODE
-      - name: Sync and verify
+      - name: Sync and verify set repository
+        if: matrix.kind == 'set'
+        working-directory: target
         env:
           EXPECTED_SHA256: ${{ needs.targets.outputs.source_sha256 }}
         run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          for (const file of ['.repo-build/config.json', 'README.md', 'llms.txt']) {
+            if (!fs.existsSync(file)) throw Error(`Set sync requires existing input: ${file}`);
+          }
+          if (!fs.existsSync('.repo-build/facts.json') && !fs.existsSync('package.json')) throw Error('Set sync requires .repo-build/facts.json or package.json');
+          const config = JSON.parse(fs.readFileSync('.repo-build/config.json', 'utf8'));
+          if (config.set?.source !== 'https://raw.githubusercontent.com/aunysillyme/.github/main/set.json') throw Error('Set source must point to the canonical main set.json');
+          NODE
           if [ -f .repo-build/set.lock.json ]; then cp .repo-build/set.lock.json "$RUNNER_TEMP/previous-set-lock.json"; fi
           env -u CI -u GITHUB_TOKEN npx --yes repo-build-skill@0.1.4 set sync
           node <<'NODE'
@@ -125,41 +109,170 @@ jobs:
           }
           NODE
           node scripts/check-set.mjs
-      - name: Create or update pull request
-        id: pr
+      - name: Copy set data for extra target
+        if: matrix.kind == 'extra'
+        working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          TARGET: ${{ matrix.target }}
+          EXPECTED_SHA256: ${{ needs.targets.outputs.source_sha256 }}
         run: |
-          files=(.repo-build/config.json .repo-build/set.json .repo-build/set.lock.json .repo-build/render-set.mjs scripts/check-set.mjs README.md llms.txt)
-          if [ -f .repo-build/facts.json ]; then files+=(.repo-build/facts.json); fi
-          git add -- "${files[@]}"
-          if git diff --cached --quiet; then
-            echo 'result=unchanged' >> "$GITHUB_OUTPUT"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const bytes = fs.readFileSync('../source/set.json');
+          if (crypto.createHash('sha256').update(bytes).digest('hex') !== process.env.EXPECTED_SHA256) throw Error('Source set does not match validated set.json');
+          const dir = '.repo-build';
+          const stat = fs.lstatSync(dir, { throwIfNoEntry: false });
+          if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) throw Error('Expected a real .repo-build directory');
+          fs.mkdirSync(dir, { recursive: true });
+          const dest = `${dir}/set.json`;
+          const file = fs.lstatSync(dest, { throwIfNoEntry: false });
+          if (file && !file.isFile()) throw Error('Expected a regular .repo-build/set.json');
+          fs.writeFileSync(dest, bytes);
+          NODE
+      - name: Package changes
+        working-directory: target
+        env:
+          KIND: ${{ matrix.kind }}
+        run: |
+          if [ "$KIND" = extra ]; then
+            files=(.repo-build/set.json)
+          else
+            files=(.repo-build/config.json .repo-build/set.json .repo-build/set.lock.json .repo-build/render-set.mjs scripts/check-set.mjs README.md llms.txt)
+            if [ -f .repo-build/facts.json ]; then files+=(.repo-build/facts.json); fi
+          fi
+          git -c core.hooksPath=/dev/null add -- "${files[@]}"
+          git -c core.hooksPath=/dev/null diff --cached --binary -- "${files[@]}" > "$RUNNER_TEMP/set-sync.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: set-sync-${{ matrix.name }}
+          path: ${{ runner.temp }}/set-sync.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [targets, prepare]
+    if: always() && needs.targets.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: set-sync-${{ matrix.name }}
+          path: ${{ runner.temp }}/set-sync
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.target }}
+          ref: main
+          persist-credentials: false
+      - name: Apply and commit changes
+        id: commit
+        env:
+          KIND: ${{ matrix.kind }}
+          EXPECTED_SHA256: ${{ needs.targets.outputs.source_sha256 }}
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          set -o pipefail
+          patch="$RUNNER_TEMP/set-sync/set-sync.patch"
+          if [ -s "$patch" ]; then
+            includes=(--include=.repo-build/set.json)
+            if [ "$KIND" = set ]; then
+              includes+=(--include=.repo-build/config.json --include=.repo-build/set.lock.json --include=.repo-build/render-set.mjs --include=scripts/check-set.mjs --include=README.md --include=llms.txt --include=.repo-build/facts.json)
+            fi
+            git -c core.hooksPath=/dev/null apply --index "${includes[@]}" "$patch"
+          fi
+          if [ "$KIND" = extra ]; then
+            mode=$(git -c core.hooksPath=/dev/null ls-files --stage -- .repo-build/set.json)
+            [[ "$mode" == 100644* || "$mode" == 100755* ]] || { echo 'Extra target set.json must be a regular file' >&2; exit 1; }
+            actual=$(git -c core.hooksPath=/dev/null show :.repo-build/set.json | sha256sum | cut -d' ' -f1)
+            [ "$actual" = "$EXPECTED_SHA256" ] || { echo 'Extra target set.json is not byte-identical to the validated source' >&2; exit 1; }
+          fi
+          if git -c core.hooksPath=/dev/null diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Sync the project set'
-          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push --force "https://github.com/$TARGET.git" HEAD:refs/heads/set-sync/update
+          git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Sync the project set'
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Mint repository token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.SET_SYNC_APP_ID }}
+          private-key: ${{ secrets.SET_SYNC_PRIVATE_KEY }}
+          owner: aunysillyme
+          repositories: ${{ matrix.name }}
+      - name: Push changes
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          auth=$(printf 'x-access-token:%s' '${{ steps.app.outputs.token }}' | base64 -w 0)
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" git -c core.hooksPath=/dev/null push --force "https://github.com/$TARGET.git" HEAD:refs/heads/set-sync/update
           unset auth
-          number=$(gh pr list --repo "$TARGET" --state open --head set-sync/update --base main --json number --jq '.[0].number // empty')
+      - name: Create or update pull request
+        if: steps.commit.outputs.changed == 'true'
+        id: pr
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RUNNER_TEMP"
+          number=$(GH_TOKEN='${{ steps.app.outputs.token }}' gh pr list --repo "$TARGET" --state open --head set-sync/update --base main --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
-            gh pr edit "$number" --repo "$TARGET" --title 'Sync the project set' --body 'Update the shared project set and generated blocks.'
+            GH_TOKEN='${{ steps.app.outputs.token }}' gh pr edit "$number" --repo "$TARGET" --title 'Sync the project set' --body 'Update the shared project set and generated blocks.'
             result='PR updated'
           else
-            gh pr create --repo "$TARGET" --head set-sync/update --base main --title 'Sync the project set' --body 'Update the shared project set and generated blocks.' > /dev/null
-            number=$(gh pr list --repo "$TARGET" --state open --head set-sync/update --base main --json number --jq '.[0].number // empty')
-            test -n "$number"
+            GH_TOKEN='${{ steps.app.outputs.token }}' gh pr create --repo "$TARGET" --head set-sync/update --base main --title 'Sync the project set' --body 'Update the shared project set and generated blocks.' > /dev/null
             result='PR opened'
           fi
-          gh pr merge "$number" --repo "$TARGET" --auto --squash
           echo "result=$result" >> "$GITHUB_OUTPUT"
+      - name: Enable auto-merge
+        if: steps.commit.outputs.changed == 'true'
+        id: auto
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RUNNER_TEMP"
+          if GH_TOKEN='${{ steps.app.outputs.token }}' gh pr merge set-sync/update --repo "$TARGET" --auto --squash 2> "$RUNNER_TEMP/auto-merge-error"; then
+            echo 'result=auto-merge enabled' >> "$GITHUB_OUTPUT"
+          else
+            reason=$(tr '\n\r' '  ' < "$RUNNER_TEMP/auto-merge-error" | sed 's/|/\\|/g')
+            echo "result=auto-merge not enabled: ${reason:-unknown error}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+      - name: Close stale pull requests and delete branch
+        if: steps.commit.outputs.changed == 'false'
+        id: cleanup
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RUNNER_TEMP"
+          numbers=$(GH_TOKEN='${{ steps.app.outputs.token }}' gh api --paginate "repos/$TARGET/pulls?state=open&head=aunysillyme:set-sync%2Fupdate&per_page=100" --jq '.[].number')
+          while IFS= read -r number; do
+            [ -z "$number" ] || GH_TOKEN='${{ steps.app.outputs.token }}' gh pr close "$number" --repo "$TARGET"
+          done <<< "$numbers"
+          branch=$(GH_TOKEN='${{ steps.app.outputs.token }}' gh api "repos/$TARGET/git/ref/heads/set-sync/update" --jq .ref 2> "$RUNNER_TEMP/branch-error") || {
+            if ! grep -q 'HTTP 404' "$RUNNER_TEMP/branch-error"; then cat "$RUNNER_TEMP/branch-error" >&2; exit 1; fi
+            branch=''
+          }
+          if [ -n "$branch" ]; then
+            GH_TOKEN='${{ steps.app.outputs.token }}' gh api --method DELETE "repos/$TARGET/git/refs/heads/set-sync/update" > /dev/null
+          fi
+          echo 'result=unchanged; stale PRs closed and branch deleted if present' >> "$GITHUB_OUTPUT"
       - name: Summarize target
         if: always()
         env:
           TARGET: ${{ matrix.target }}
-          RESULT: ${{ steps.pr.outputs.result }}
+          PR_RESULT: ${{ steps.pr.outputs.result }}
+          AUTO_RESULT: ${{ steps.auto.outputs.result }}
+          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result }}
         run: |
-          printf '| Target | Result |\n| --- | --- |\n| %s | %s |\n' "$TARGET" "${RESULT:-failed}" >> "$GITHUB_STEP_SUMMARY"
+          result="${CLEANUP_RESULT:-${PR_RESULT:-failed}}"
+          if [ -n "$AUTO_RESULT" ]; then result="$result; $AUTO_RESULT"; fi
+          printf '| Target | Result |\n| --- | --- |\n| %s | %s |\n' "$TARGET" "$result" >> "$GITHUB_STEP_SUMMARY"
