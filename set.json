@@ -40,6 +40,11 @@
       "name": "aunx-skills",
       "url": "https://github.com/aunysillyme-dev/aunx-skills",
       "line": "Ten standalone agent skills for Claude Code, Codex, Cursor and Gemini CLI: full output keeper, number guard, docs fetch ladder, rename sweep and more"
+    },
+    {
+      "name": "stack",
+      "url": "https://github.com/aunysillyme-dev/stack",
+      "line": "AI tools list for everything you build with AI: curated stacks of tools, models and workflows as open JSON. Video and design live, more coming."
     }
   ]
 }
